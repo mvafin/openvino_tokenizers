@@ -134,6 +134,34 @@ def _build_decoder_model(model_bytes, *, fairseq=False):
     )
 
 
+def _build_decoder_model_dynamic_rank(model_bytes):
+    # Same as _build_decoder_model but the token-ids input is declared with an
+    # unknown rank (shape=None). The SentencepieceDetokenizer translator must not
+    # assume a static rank during validation; it should defer the 2D check until
+    # the rank is known. Mirrors a decoder fed from a Loop output whose shape is
+    # not yet inferred at translation time (e.g. WordFluencyV4).
+    nodes = [
+        _scalar_const("fairseq", [False], TensorProto.BOOL),
+        helper.make_node(
+            "SentencepieceDecoder",
+            ["ids", "fairseq"],
+            ["text"],
+            domain="ai.onnx.contrib",
+            model=model_bytes,
+        ),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "decoder_dyn_rank",
+        [helper.make_tensor_value_info("ids", TensorProto.INT64, None)],
+        [helper.make_tensor_value_info("text", TensorProto.STRING, [None])],
+    )
+    return helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 17), helper.make_opsetid("ai.onnx.contrib", 1)],
+    )
+
+
 def _build_vector_to_string_model(map_text, unk):
     node = helper.make_node(
         "VectorToString",
@@ -293,6 +321,21 @@ def test_sentencepiece_decoder(spm_model, tmp_path, text):
     decoded = outputs[0].str_data[0]
 
     assert decoded == processor.decode(ids)
+
+
+def test_sentencepiece_decoder_dynamic_rank_input(spm_model, tmp_path):
+    # Regression: the decoder's token-ids input has an unknown rank at read time
+    # (e.g. fed from a Loop output whose shape is not yet inferred, as in
+    # WordFluencyV4). SentencepieceDetokenizer::validate_and_infer_types must not
+    # call PartialShape::size() on a dynamic-rank input — that throws
+    # 'rank().is_static()' and aborts conversion. The op must defer the 2D check
+    # until the rank is known, so read_model succeeds and the detokenizer output
+    # is a (dynamic) string tensor.
+    model_bytes, _ = spm_model
+    onnx_path = _save(_build_decoder_model_dynamic_rank(model_bytes), tmp_path, "dec_dyn_rank.onnx")
+
+    model = ov.Core().read_model(onnx_path)  # must not raise
+    assert model.output(0).get_element_type() == ov.Type.string
 
 
 def test_sentencepiece_decoder_fairseq_true_unsupported(spm_model, tmp_path):
